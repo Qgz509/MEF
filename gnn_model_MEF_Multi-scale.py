@@ -12,18 +12,19 @@ from sklearn.isotonic import IsotonicRegression
 import networkx as nx
 from scipy.sparse import csgraph
 import matplotlib.pyplot as plt
+from mef_getdata import mef_getdata
 
 # ========== 配置 ==========
-DATA_DIR = r"C:\Users\qgz23\Desktop\CarbonFactor\data\IEEE_39_Multi"   # 用原始字符串避免转义
+DATA_DIR = r"F:\\CarbonFactor\\data\\IEEE_39_Multi_totransformer\\"   # 用原始字符串避免转义
 #多尺度窗口配置（15min/步）
-WINDOW_15MIN   = 80         #15min尺度：80步=20小时（短周期依赖）
-WINDOW_1H   = 4             #1h尺度：4步=1小时（中周期依赖）
+WINDOW_15MIN   = 16         #4h尺度：1（短周期依赖）
+WINDOW_1H   = 32             #8h尺度：4步=1小时（中周期依赖）
 WINDOW_24H   = 96           #24h尺度：96步=24小时（长周期依赖）
 MAX_WINDOW = max(WINDOW_15MIN, WINDOW_1H, WINDOW_24H)
 RIDGE_ALPHA = 1e-1  # 岭回归正则化参数
 LAPL_BETA   = 1e-2  # 拉普拉斯矩阵正则化参数
 TRAIN_RATIO = 0.8     # 训练集比例
-EPOCHS  = 20            #（训练轮数）
+EPOCHS  = 1           #（训练轮数）
 LR      = 1e-2           #（学习率） 提高一点更容易“破常数”
 WEIGHT_DECAY = 1e-5  #（权重衰减） 防止过拟合
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
@@ -33,184 +34,6 @@ LAMBDA_SMOOTH = 1e-5    #拉普拉斯平滑系数（轻度约束）
 os.makedirs(SAVE_DIR, exist_ok=True)
 SEED=20250809; np.random.seed(SEED); torch.manual_seed(SEED)    #固定随机种子（实验可复现）
 
-# ========== 读取基准与图 ==========
-def load_base():
-    bus0 = pd.read_csv(os.path.join(DATA_DIR,"bus_base.csv"), header=None)  #节点信息
-    gen0 = pd.read_csv(os.path.join(DATA_DIR,"gen_base.csv"), header=None)  #发电机组信息
-    br0  = pd.read_csv(os.path.join(DATA_DIR,"branch_base.csv"), header=None)   #支路信息
-    return bus0, gen0, br0
-
-def graph_from_branch(br0, bus0):
-    BUS_I=0; F_BUS=0; T_BUS=1; XCOL=3    #列索引定义（适配IEEE39数据）
-    bus_ids = bus0.iloc[:,BUS_I].astype(int).values    # 节点ID
-    id2idx = {b:i for i,b in enumerate(bus_ids)}    #节点ID映射到索引
-    f = br0.iloc[:,F_BUS].astype(int).map(id2idx).values    # 支路起点索引
-    t = br0.iloc[:,T_BUS].astype(int).map(id2idx).values    # 支路终点索引
-    # 注意：训练里我们先不使用 edge_weight，避免权重尺度把消息传递毁掉
-    edge_index = np.vstack([np.concatenate([f,t]), np.concatenate([t,f])])  # 边索引（双向存储）
-
-    G = nx.Graph(); N=len(bus_ids)
-    G.add_nodes_from(range(N)); G.add_edges_from([(int(fi),int(ti)) for fi,ti in zip(f,t)])
-    A = nx.to_scipy_sparse_array(G, nodelist=range(N), format="csr")    # 邻接矩阵（稀疏）
-    L = csgraph.laplacian(A, normed=False).toarray()    # 拉普拉斯矩阵（平滑正则）
-    deg = np.array([d for _,d in G.degree()], dtype=float)  # 节点度数（特征输入）
-    return edge_index, L, deg, len(bus_ids), bus_ids
-
-# ========== 读取时序 ==========
-def list_time_steps():
-    bus_files = sorted(glob.glob(os.path.join(DATA_DIR, "bus_t_*.csv")))    # 遍历所以节点时序文件
-    steps=[]
-    for bf in bus_files:
-        t = int(os.path.basename(bf).split('_')[-1].split('.')[0])  # 提取时间步编号
-        gf = os.path.join(DATA_DIR, f"gen_t_{t:05d}.csv")    # 对应发电机组时序文件
-        rf = os.path.join(DATA_DIR, f"branch_t_{t:05d}.csv")    # 对应支路时序文件
-        if os.path.exists(gf) and os.path.exists(rf):    # 确保三件套完整
-            steps.append(t)
-    return steps
-
-def compute_co2_series_from_gen():
-    """严格按 eg_used.csv + gen_t_*.csv 重算系统CO2（tCO2）"""
-    eg_used = pd.read_csv(os.path.join(DATA_DIR,'eg_used.csv'), header=None).values.reshape(-1)  # 发电机碳排放系数（tCO2/MWh）
-    steps = sorted(int(os.path.basename(p).split('_')[-1].split('.')[0])
-                   for p in glob.glob(os.path.join(DATA_DIR, "gen_t_*.csv")))    # 所有发电机时序时间步
-    co2_map = {}
-    for t in steps:
-        gen_t = pd.read_csv(os.path.join(DATA_DIR, f"gen_t_{t:05d}.csv"), header=None).values
-        Pg = np.maximum(gen_t[:,1].astype(float), 0.0)    # 第2列：发电机有功功率（MW），取正（避免不合理数据）
-        co2_map[t] = float(np.sum(eg_used * Pg))    # 计算系统总CO2排放量
-    return co2_map
-
-# ========== μ 标签反演 ==========
-def invert_mu_window(P_hist, CO2_hist, L, t_idx, window=80, alpha=1e-1, beta=1e-2):
-    """返回 μ_t 以及窗口拟合残差 rmse；包含自适应正则与窗口回退"""
-    N = P_hist.shape[1]  # 节点数
-    lo = max(0, t_idx - window + 1); hi = t_idx + 1      # 窗口边界
-    X = P_hist[lo:hi] - P_hist[[t_idx]]  # 输入特征：窗口内节点功率相对于当前步的变化量[W,N]
-    y = CO2_hist[lo:hi] - CO2_hist[t_idx]   # 目标变量：窗口内CO2排放量相对于当前步的变化量[W]
-    m = np.isfinite(y)  # 过滤掉无效数据
-    X = X[m]; y = y[m]
-    if len(y) == 0:
-        return np.zeros(N), np.nan  # 窗口内无有效数据，返回默认值
-    # 构建正则化方程组
-    XtX = X.T @ X; Xty = X.T @ y
-    A = XtX + alpha*np.eye(N) + beta*L  # 正则化系数矩阵（加入L2正则+拉普拉斯正则）
-
-    try: condA = np.linalg.cond(A)  # 条件数（判断是否病态）
-    except: condA = 1e12
-    fac_used = 1.0
-    if condA > 1e8:
-        fac_used = min(condA/1e8, 100.0)
-        A = XtX + (alpha*fac_used)*np.eye(N) + beta*L
-        # 窗口回退（缩短窗口避免工况切换导致数据混叠）
-        if (hi-lo) > 40:
-            X = X[-40:]; y = y[-40:]
-            XtX = X.T @ X; Xty = X.T @ y
-            A = XtX + (alpha*fac_used)*np.eye(N) + beta*L
-
-    try:
-        mu = np.linalg.solve(A, Xty)    # 解线性方程组
-    except np.linalg.LinAlgError:
-        mu = np.linalg.lstsq(A, Xty, rcond=None)[0]  # 最小二乘解
-
-    y_hat = X @ mu   # 预测值
-    rmse = float(np.sqrt(np.mean((y_hat - y)**2)))  # 窗口拟合残差
-    return mu, rmse
-
-# ========== 构建多尺度数据集 ==========
-def build_dataset():
-    bus0, gen0, br0 = load_base()
-    edge_idx_np, L, deg, N, bus_ids = graph_from_branch(br0, bus0)
-    PD_col=2    #节点功率列索引
-
-    steps = list_time_steps()
-    if len(steps)==0: raise RuntimeError("未发现 bus_t_*.csv 三件套。")
-
-    # 加载时序数据并过滤无效数据
-    P_hist=[]; valid_map=[]
-    for t in steps:
-        bus_t = pd.read_csv(os.path.join(DATA_DIR, f"bus_t_{t:05d}.csv"), header=None).values
-        if not np.isfinite(bus_t).all(): continue    # 过滤无效数据
-        P_hist.append(bus_t[:,PD_col].astype(float))    #提取节点功率
-        valid_map.append(t)
-    P_hist = np.vstack(P_hist)  # [T_valid, N]：有效时间步*节点数
-    T_valid = P_hist.shape[0]
-
-    # 构造节点特征：当前功率、功率变化、节点度数（3维特征）
-    deg_vec = deg
-    X_frames=[]
-    for k in range(T_valid):
-        pd_now = P_hist[k]
-        pd_prev= P_hist[max(0,k-1)] #（避免k=0时取不到前一时刻功率）
-        x = np.stack([pd_now, pd_now-pd_prev, deg_vec], axis=1)  # [N,3]
-        X_frames.append(x)
-    X_frames = np.asarray(X_frames)  # [T_valid, N, 3]
-
-    # 特征标准化（仅用训练集统计量，避免数据泄露）
-    split_tmp = int(TRAIN_RATIO*T_valid)
-    flat_train = X_frames[:split_tmp].reshape(-1, X_frames.shape[-1])
-    mu_feat = flat_train.mean(0); std_feat=flat_train.std(0)+1e-8    # 均值、标准差（+1e-8防止除零）
-    X_frames = (X_frames - mu_feat)/std_feat
-
-    # 加载并对齐CO2排放量时序
-    co2_map = compute_co2_series_from_gen()
-    co2_vec = np.array([co2_map.get(t, np.nan) for t in valid_map])
-
-    # 加载全局工况特征并标准化
-    g_list = []
-    for t in valid_map:
-        try:
-            g_list.append(regime_feats_for_t(t))
-        except:
-            g_list.append(np.array([0.0, 0.0], dtype=float))    # 若无对应时序文件，用默认值代替
-    g_arr = np.vstack(g_list)  # [T_valid, 2]
-    mu_g = g_arr[:split_tmp].mean(0)
-    std_g = g_arr[:split_tmp].std(0) + 1e-8
-    g_arr = (g_arr - mu_g) / std_g
-
-    # 组装多尺度PyG数据集（适配GNN训练）
-    data_list=[]
-    edge_index = torch.tensor(edge_idx_np, dtype=torch.long)
-    for k in range(T_valid):
-        if k < MAX_WINDOW-1: continue    # 跳过过早时间步（不足窗口长度）
-        #反演当前步的μ标签
-        mu_k, _ = invert_mu_window(P_hist, co2_vec, L, k, window=WINDOW_15MIN,
-                                   alpha=RIDGE_ALPHA, beta=LAPL_BETA)  # [N]
-        #提取多尺度时序特征序列
-        seq_15min = X_frames[k-WINDOW_15MIN+1:k+1]  # [80,N,3]
-        seq_1h = X_frames[k-WINDOW_1H+1:k+1]       # [4,N,3]
-        seq_24h = X_frames[k-WINDOW_24H+1:k+1]      # [96,N,3]
-        g_vec = torch.tensor(g_arr[k], dtype=torch.float)  # 全局工况特征[2]
-        # 构建PyG数据对象
-        data = Data(
-            x_15min=torch.tensor(seq_15min, dtype=torch.float), #15min尺度输入
-            x_1h=torch.tensor(seq_1h, dtype=torch.float),     #1h尺度输入
-            x_24h=torch.tensor(seq_24h, dtype=torch.float),    #24h尺度输入
-            y=torch.tensor(np.asarray(mu_k), dtype=torch.float).view(-1,1), #标签[N,1]
-            edge_index=edge_index,    #图边索引（双向）
-            g=g_vec  #全局工况特征[2]
-        )
-        data.num_nodes = N    # 节点数
-        data_list.append(data)
-
-    return data_list, N, bus_ids, mu_g, std_g
-
-
-def regime_feats_for_t(t):
-    """计算某时间步的全局工况特征（拥堵状态识别）"""
-    # 你导出的 branch_t_* 里若没有潮流列，可先用 DC 角差/x 计算；若已有 PF 列直接用它
-    BR = pd.read_csv(os.path.join(DATA_DIR, f"branch_t_{t:05d}.csv"), header=None).values
-    RATE_A = 5   # 支路额定容量列索引（case39 默认第6列，0-based=5）
-    # 若有潮流列 PF/|S| 请改成对应列；没有就退化：以 θ 差推流略过（不影响特征趋势）
-    if BR.shape[1] > 13:
-        PF_COL = 13 #潮流列索引
-        flow = np.abs(BR[:, PF_COL].astype(float))  # 绝对值支路潮流
-    else:
-        flow = np.zeros(len(BR))  # 没有就用0占位，不会影响能学性的比较
-    rate = np.maximum(BR[:, RATE_A].astype(float), 1e-6)    # 支路额定容量（避免除以0）
-    loading = flow / rate    # 支路载荷（流量/容量）
-    bind_ratio = float(np.mean(loading > 0.95))  # 绑定占比
-    max_loading = float(np.max(loading))    # 最大载荷
-    return np.array([bind_ratio, max_loading], dtype=float)
 
 
 # ========== 模型 ==========
@@ -241,64 +64,110 @@ class STMoE(nn.Module):
         self.temporal_24h = TemporalEncoder(in_dim=in_dim, d_model=d_model, nhead=4,
                                              num_layers=3, dim_ff=4*d_model, dropout=dropout)    #长周期（24h，三层增强建模）
         self.proj_last = nn.Linear(in_dim, d_model)     #最后一帧特征维度映射
-        self.fuse = nn.Linear(7*d_model, gcn_hid)   #多尺度特征融合（6个时序表征+1个最后一帧特征=7*d_model）
+        self.scale_gate = nn.Linear(3 * d_model + 2, 3)  # 输入=三个尺度摘要+全局g(2维)，输出3个尺度权重
+        self.fuse = nn.Linear(d_model + d_model, gcn_hid)  # 改：融合后的尺度向量(d_model) + last_proj(d_model)
+        # self.fuse = nn.Linear(7*d_model, gcn_hid)   #多尺度特征融合（6个时序表征+1个最后一帧特征=7*d_model）
         self.g1 = GCNConv(gcn_hid, gcn_hid)    # GCN层1：捕捉空间依赖
         self.g2 = GCNConv(gcn_hid, gcn_hid)      # GCN层2：增强空间表征
-        self.experts = nn.ModuleList([nn.Linear(gcn_hid, 1) for _ in range(K)])  # k个专家网络（适配不同工况）
-        self.gate_lin = nn.Linear(gcn_hid + 2, K)    # 门控网络（输入空间特征+全局工况特征，输出k个专家权重）
+
+        def _make_expert():
+            return nn.Sequential(
+                nn.Linear(gcn_hid, gcn_hid),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(gcn_hid, 1)
+            )
+
+        self.experts = nn.ModuleList([_make_expert() for _ in range(K)])
+        # self.experts = nn.ModuleList([nn.Linear(gcn_hid, 1) for _ in range(K)])  # k个专家网络（适配不同工况）
+        self.gate_lin = nn.Linear(gcn_hid + gcn_hid + 2, K)  # 输入: z(融合后) + h(GCN后) + g
+
         self.drop = dropout
+
 
     def forward(self, data):
         #多尺度时序编码
         x_last = data.x_15min[-1]    # 最后一帧特征[N,3]
-        h_last_15, h_mean_15 = self.temporal_15min(data.x_15min)    #15min尺度特征[N,d_model]*2
-        h_last_1h, h_mean_1h = self.temporal_1h(data.x_1h)    #1h尺度特征[N,d_model]*2
-        h_last_24h, h_mean_24h = self.temporal_24h(data.x_24h)  #24h尺度特征[N,d_model]*2
+        h_last_15, h_attn_15, h_mean_15 = self.temporal_15min(data.x_15min)
+        h_last_1h, h_attn_1h, h_mean_1h = self.temporal_1h(data.x_1h)
+        h_last_24h, h_attn_24h, h_mean_24h = self.temporal_24h(data.x_24h)
+
         last_proj = self.proj_last(x_last)    # 最后一帧特征映射[N,d_model]
         # 融合多尺度特征
-        z = torch.cat([h_last_15, h_mean_15,
-                       h_last_1h, h_mean_1h,
-                       h_last_24h, h_mean_24h,
-                       last_proj], dim=-1)    # [N,7*d_model]
-        z = F.relu(self.fuse(z))    # 融合为空间特征输入[N,gcn_hid]
+        # 每个尺度用 (last + attn) 做摘要（最小且有效）
+        s15 = 0.5 * (h_last_15 + h_attn_15)  # [N,d]
+        s1h = 0.5 * (h_last_1h + h_attn_1h)  # [N,d]
+        s24 = 0.5 * (h_last_24h + h_attn_24h)  # [N,d]
+
+        # 生成尺度权重：用全局g + 3个尺度摘要的“节点均值”（更稳）
+        g_b = data.g.view(1, -1).repeat(s15.size(0), 1)  # [N,2]
+        s_mean = torch.cat([s15, s1h, s24], dim=-1)  # [N,3d]
+        scale_logits = self.scale_gate(torch.cat([s_mean, g_b], dim=-1))  # [N,3]
+        scale_w = torch.softmax(scale_logits, dim=-1)  # [N,3]
+
+        # 加权融合成一个尺度向量
+        s = (scale_w[:, [0]] * s15 +
+             scale_w[:, [1]] * s1h +
+             scale_w[:, [2]] * s24)  # [N,d]
+
+        # 再拼上最后一帧映射（保留你原来的 last_proj 思路）
+        z = torch.cat([s, last_proj], dim=-1)  # [N,2d]
+        z = F.relu(self.fuse(z))  # [N,gcn_hid]
+
         # GCN捕捉空间依赖
-        h = F.relu(self.g1(z, data.edge_index))      # 空间表征1[N,gcn_hid]
-        h = F.dropout(h, p=self.drop, training=self.training)    # dropout防止过拟合
-        h = F.relu(self.g2(h, data.edge_index))          # 空间表征2[N,gcn_hid]
+        h = F.relu(self.g1(z, data.edge_index, data.edge_weight))
+        h = F.dropout(h, p=self.drop, training=self.training)
+        h = F.relu(self.g2(h, data.edge_index, data.edge_weight))
 
         # 门控网络（工况自适应分配专家权重）
         g_b = data.g.view(1, -1).repeat(h.size(0), 1)    # 全局工况特征广播到每个节点[N,2]
-        gate_w = F.softmax(self.gate_lin(torch.cat([h, g_b], dim=-1)), dim=-1)  # 专家权重（softmax归一化）[N,K]
-
+        gate_in = torch.cat([z, h, g_b], dim=-1)  # [N, 2*gcn_hid + 2]
+        gate_w = F.softmax(self.gate_lin(gate_in), dim=-1)
         # 混合专家预测
         outs = torch.stack([exp(h) for exp in self.experts], dim=-1)            # 每个专家输出[N,1,K]
         y = (outs.squeeze(1) * gate_w).sum(dim=-1, keepdim=True)                # 加权求和（权重自适应）[N,1]
         return y
 
+class AttnPool(nn.Module):
+    """单头 attention pooling：让模型学‘哪些时刻更重要’"""
+    def __init__(self, d_model):
+        super().__init__()
+        self.proj = nn.Linear(d_model, d_model)
+        self.scorer = nn.Linear(d_model, 1, bias=False)
+
+    def forward(self, h):  # h: [N, W, d]
+        s = self.scorer(torch.tanh(self.proj(h))).squeeze(-1)  # [N, W]
+        w = torch.softmax(s, dim=1).unsqueeze(-1)              # [N, W, 1]
+        z = (w * h).sum(dim=1)                                 # [N, d]
+        return z
+
 
 class TemporalEncoder(nn.Module):
-    """时序编码器：基于Transformer捕捉时序依赖，输出最后一步特征和平均特征"""
+    """时序编码器：Transformer + (last/attn/mean) 三种摘要"""
     def __init__(self, in_dim, d_model=64, nhead=4, num_layers=2, dim_ff=128, dropout=0.1):
         super().__init__()
-        self.inp = nn.Linear(in_dim, d_model)    # 输入特征维度映射（3 -> d_model）
-        #Transformer编码器层（批量优先、先归一化）
+        self.inp = nn.Linear(in_dim, d_model)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
             dropout=dropout, batch_first=True, norm_first=True
         )
-        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers,enable_nested_tensor=False)    # 堆叠多层编码器
-        self.pe = PosEnc(d_model)    # 位置编码
-        self.ln = nn.LayerNorm(d_model)    # 层归一化（稳定训练）
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers, enable_nested_tensor=False)
+        self.pe = PosEnc(d_model)
+        self.ln = nn.LayerNorm(d_model)
+        self.pool = AttnPool(d_model)
 
-    def forward(self, x_seq):      # x_seq: [W, N, F]
-        x_seq = x_seq.permute(1, 0, 2)        # 维度转换[N, W, F]（适配Transformer批量优先）
-        h = self.inp(x_seq)                   # 特征维度映射[N, W, d_model]
-        h = self.pe(h)                       # 注入位置信息
-        h = self.enc(h)                       # Transformer编码（捕捉时序依赖）
-        h = self.ln(h)                       # 层归一化
-        h_last = h[:, -1, :]                  # 最后一步特征[N, d_model]（保留近期信息）
-        h_mean = h.mean(dim=1)                # 序列平均特征[N, d_model]（保留全局趋势）
-        return h_last, h_mean
+    def forward(self, x_seq):  # x_seq: [W, N, F]
+        x_seq = x_seq.permute(1, 0, 2)   # [N, W, F]
+        h = self.inp(x_seq)              # [N, W, d]
+        h = self.pe(h)
+        h = self.enc(h)
+        h = self.ln(h)
+
+        h_last = h[:, -1, :]             # [N, d]
+        h_attn = self.pool(h)            # [N, d]
+        h_mean = h.mean(dim=1)           # [N, d]
+        return h_last, h_attn, h_mean
+
 
 class STGNN(nn.Module):
     """单尺度版本，未修改"""
@@ -333,9 +202,9 @@ class GCNOnly(nn.Module):
         self.drop = drop
     def forward(self, data):
         x = data.x_15min[-1]  # 仅用最后一帧 [N,F]
-        h = F.relu(self.g1(x, data.edge_index))
+        h = F.relu(self.g1(x, data.edge_index, data.edge_weight))
         h = F.dropout(h, p=self.drop, training=self.training)
-        h = F.relu(self.g2(h, data.edge_index))
+        h = F.relu(self.g2(h, data.edge_index, data.edge_weight))
         return self.out(h)
 
 def lap_smooth_loss(y_pred, edge_index):
@@ -407,7 +276,8 @@ def eval_flat_and_plot(model, valid_loader, mu_y, std_y, save_dir, use_calibrato
 # ========== 训练与评估 ==========
 def train_eval():
     # 数据准备
-    data_list, N, bus_ids, mu_g, std_g = build_dataset()    # 加载多尺度数据集
+    getData = mef_getdata(DATA_DIR)
+    data_list, N, bus_ids, mu_g, std_g = getData.build_dataset()    # 加载多尺度数据集
     T = len(data_list); assert T > 1, "样本太少"
 
     # 标签分布统计（辅助参数调整）
@@ -467,18 +337,47 @@ def train_eval():
     for ep in range(1, EPOCHS + 1):
         # 训练阶段
         model.train(); tr = 0.0
-        for data in train_loader:
+        for it, data in enumerate(train_loader):
+            opt.zero_grad(set_to_none=True);
             data = data.to(DEVICE)
             pred = model(data)
             base = crit(pred, data.y)    # 基础MSE损失
-            smooth = lap_smooth_loss(pred, data.edge_index)  # 拉普拉斯平滑损失
-            loss = base + LAMBDA_SMOOTH * smooth     # 总损失(MSE+平滑)
+            # smooth = lap_smooth_loss(pred, data.edge_index)  # 拉普拉斯平滑损失
+            # loss = base + LAMBDA_SMOOTH * smooth     # 总损失(MSE+平滑)
+            loss = base
+            w0 = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
             #梯度下降
-            opt.zero_grad(); loss.backward()     # 梯度清零、反向传播
+            loss.backward()     # 梯度清零、反向传播
+            # 统计全局梯度，而不是 next(...)
+            tot = 0.0
+            cnt = 0
+            maxg = 0.0
+            for n, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                g = p.grad.detach().abs()
+                tot += g.mean().item()
+                cnt += 1
+                maxg = max(maxg, g.max().item())
+            # print("grad mean(all):", tot / max(1, cnt), "grad max(all):", maxg)
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)    #梯度裁剪
             opt.step()    # 更新参数
+            # 参数变化也建议统计所有参数
+            delta = 0.0
+            cnt = 0
+            for n, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                delta += (p.detach() - w0[n]).abs().mean().item()
+                cnt += 1
+            # print("param delta(all):", delta / max(1, cnt))
+            #
+            # print("pred mean/std:", pred.detach().mean().item(), pred.detach().std().item())
+
             tr += loss.item()
         tr /= max(1, len(train_loader))    # 训练损失（平均值）
+
 
         # 验证阶段
         model.eval(); va = 0.0
